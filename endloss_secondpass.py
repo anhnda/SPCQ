@@ -352,9 +352,11 @@ def endloss_gradient(student, teacher, lats, opt_ids, device, cfg) -> dict:
         m.weight.requires_grad_(want)
         if m.weight.grad is not None:
             m.weight.grad = None
+    n_chunks = 0
     for i in range(0, len(opt_ids), cfg.grad_batch):
         ids = torch.stack(opt_ids[i:i + cfg.grad_batch]).to(device)
         end_loss(student, teacher, ids, device, cfg.loss_kind).backward()
+        n_chunks += 1
         _free()
     c = {}
     with torch.no_grad():
@@ -362,6 +364,10 @@ def endloss_gradient(student, teacher, lats, opt_ids, device, cfg) -> dict:
             g = lin[n].weight.grad
             if g is None:
                 continue
+            # grads were ACCUMULATED (summed) over chunks but the loss/acceptance are
+            # per-chunk MEANs, so divide to get the gradient of the mean loss -- keeps
+            # c on the same scale as the true dL measured by eval_end_loss.
+            g = g / max(n_chunks, 1)
             step = lats[n].step()[:, : lats[n].in_features]
             c[n] = (g.to(LATTICE_DTYPE) * step)
     for m in lin.values():
