@@ -284,13 +284,13 @@ def collect_act_means(model, calib_ids, device, batch: int = 2) -> dict:
 
 
 def end_loss(student, teacher, ids, device, kind: str) -> torch.Tensor:
-    logits_s = student(ids.to(device)).logits
+    logits_s = student(ids.to(device), use_cache=False).logits
     if kind == "ce":
         sl = logits_s[:, :-1].reshape(-1, logits_s.shape[-1]).float()
         lab = ids[:, 1:].reshape(-1).to(device)
         return nn.functional.cross_entropy(sl, lab)
     with torch.no_grad():
-        logp_t = torch.log_softmax(teacher(ids.to(device)).logits.float(), dim=-1)
+        logp_t = torch.log_softmax(teacher(ids.to(device), use_cache=False).logits.float(), dim=-1)
     logp_s = torch.log_softmax(logits_s.float(), dim=-1)
     return (logp_t.exp() * (logp_t - logp_s)).sum(-1).mean()
 
@@ -319,6 +319,9 @@ class EndLossConfig:
     refresh_every: int = 4
     max_rounds: int = 60
     grad_batch: int = 2
+    grad_seqlen: int = 512   # sequence length for end-loss passes (backward/accept);
+    #                          short on purpose -- the big-vocab logits in the backward
+    #                          are the memory killer, and 512 tokens is plenty of signal.
     loss_kind: str = "kl"
     seed: int = 0
 
@@ -566,7 +569,9 @@ def main():
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--opt-seqs", type=int, default=16)
     ap.add_argument("--acc-seqs", type=int, default=8)
-    ap.add_argument("--grad-batch", type=int, default=2)
+    ap.add_argument("--grad-batch", type=int, default=1)
+    ap.add_argument("--grad-seqlen", type=int, default=512,
+                    help="seq length for end-loss backward/accept (PPL eval stays full)")
     ap.add_argument("--flip-percent", type=float, default=0.02)
     ap.add_argument("--loss-kind", choices=["kl", "ce"], default="ce")
     ap.add_argument("--layers", default="all")
@@ -641,16 +646,21 @@ def main():
     reset_fp()
     lats_el = quantize_model_rtn(model, args.bits, args.group_size, keep_residual=False)
     cfg = EndLossConfig(max_flip_percent=args.flip_percent, layers=layers,
-                        loss_kind=args.loss_kind, grad_batch=args.grad_batch, seed=args.seed)
-    el_log = run_endloss_secondpass(model, teacher, lats_el, opt_ids, acc_ids, device, cfg)
+                        loss_kind=args.loss_kind, grad_batch=args.grad_batch,
+                        grad_seqlen=args.grad_seqlen, seed=args.seed)
+    # short sequences for the end-loss passes: big-vocab logits in the backward are the
+    # memory bottleneck, and the gradient/acceptance signal does not need 2048 tokens.
+    opt_el = [s[: cfg.grad_seqlen] for s in opt_ids]
+    acc_el = [s[: cfg.grad_seqlen] for s in acc_ids]
+    el_log = run_endloss_secondpass(model, teacher, lats_el, opt_el, acc_el, device, cfg)
     ppl_el = eval_ppl(model, test_ids, device, args.seqlen, args.ppl_max_chunks)
     results["rtn_endloss"] = {"ppl": ppl_el, **el_log, "G_recovery": G_recovery(ppl_rtn, ppl_el, ppl_fp)}
     print(f"[ours] ppl={ppl_el:.4f} flips={el_log['flips_total']} cost={el_log['cost']} "
           f"G={results['rtn_endloss']['G_recovery']:.3f}")
 
     if args.audit:
-        c = endloss_gradient(model, teacher, lats_el, opt_ids, device, cfg)
-        a1 = audit_grad_vs_truth(model, teacher, lats_el, c, opt_ids, device, cfg)
+        c = endloss_gradient(model, teacher, lats_el, opt_el, device, cfg)
+        a1 = audit_grad_vs_truth(model, teacher, lats_el, c, opt_el, device, cfg)
         a2 = audit_clc_vs_endloss(clc_flips, c)
         results["audit"] = {"grad_vs_truth": a1, "clc_vs_endloss": a2}
         print(f"[audit] grad_vs_truth={a1}")
